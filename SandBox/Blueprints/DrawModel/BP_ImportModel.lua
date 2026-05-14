@@ -79,11 +79,11 @@ function M:Initialize(Initializer)
     self.bMove = true
     self.bLoading = false -- 加载状态标记
     self.MaterialDatas = {}
-    -- 前端交互用：GetData/SetData 透传的材质状态，结构为 { [MaterialKey] = MaterialState }。
+    -- 优化：统一材质保存字段。MaterialSaveData 同时供 GetData/ModelSave 输出，
+    -- 并与 MaterialDatas[*].SourceState 对齐；SetData 的外部修改先进入 CurrentState/MID，
+    -- 只有显式提交时才复制回 SourceState/MaterialSaveData。
     self.MaterialSaveData = nil
-    -- 存档用：ModelSave/ModelLoad 使用的“已保存 SourceState”，不要与 MaterialSaveData 混用。
-    self.MaterialSourceSaveData = nil
-    self.LoadMaterialSourceSaveData = nil
+    -- 优化：异步加载前缓存待应用的统一材质字段，替代旧的 Source/Interaction 两套 Load 数据。
     self.LoadMaterialSaveData = nil
 end
 
@@ -170,15 +170,14 @@ end
 
 --[[
     接口函数：模型存档输出。
+    优化：统一使用 Materials 字段保存材质状态，结构与 MaterialDatas[*].SourceState 对齐。
     通信结构：
     {
         ModelCode, OriginalSize, BSize, Path, CType,
-        MaterialSourceStates = {
-            [MaterialKey] = { TemplateID, TemplateName, Params = { BaseColorConstant, MetallicRation, ... } }
+        Materials = {
+            [MaterialKey] = { TemplateName = string | nil, Params = { BaseColorConstant, MetallicRation, ... } }
         }
     }
-    注意：ModelSave/ModelLoad 只使用 MaterialSourceStates 保存“已保存的 SourceState”，
-    不和前端交互用的 MaterialSaveData 混用。
 ]]
 function M:ModelSave()
     if self.size == UE.FVector(0, 0, 0) then
@@ -192,19 +191,21 @@ function M:ModelSave()
         ["BSize"] = UE.UJsonLibraryHelpers.JsonValue_Stringify(UE.UJsonLibraryHelpers.FromVector(self.size)),
         ["Path"] = self.path,
         ["CType"] = self.clickType,
-        ["MaterialSourceStates"] = self:SaveMaterialSourceStates(),
+        -- 优化：存档与前端统一使用 Materials，不再写 MaterialSourceStates/MaterialStates。
+        ["Materials"] = self:SaveMaterialDatas(),
     }
     return table
 end
 
 --[[
     接口函数：模型存档读取。
-    通信结构同 ModelSave；Materials 仅作为旧数据兼容入口读取，不再作为新的存档字段写出。
+    通信结构同 ModelSave；MaterialSourceStates/MaterialStates 仅作为旧数据兼容入口读取。
 ]]
 function M:ModelLoad(table, bUndo)
     local BS                  = UE.UJsonLibraryHelpers.ToVector(UE.UJsonLibraryHelpers.Parse(table["BSize"]))
     local OS                  = UE.UJsonLibraryHelpers.ToVector(UE.UJsonLibraryHelpers.Parse(table["OriginalSize"]))
-    local SourceSaveData      = table["MaterialSourceStates"] or table["Materials"]
+    -- 优化：读取时兼容旧字段，内部统一归一到 MaterialSaveData。
+    local SourceSaveData      = table["Materials"] or table["MaterialStates"] or table["MaterialSourceStates"]
 
     self.modelCode            = table["ModelCode"]
     self.path                 = table["Path"]
@@ -212,14 +213,12 @@ function M:ModelLoad(table, bUndo)
     self.modelType            = table["Type"]
     self.size                 = BS
     self.originalSize         = OS
-    self.MaterialSourceSaveData = self:NormalizeMaterialSourceSaveData(SourceSaveData)
-    self.LoadMaterialSourceSaveData = self:DeepCopy(self.MaterialSourceSaveData)
-    self.MaterialSaveData     = self:DeepCopy(self.MaterialSourceSaveData)
-    self.LoadMaterialSaveData = nil
+    self.MaterialSaveData     = self:NormalizeMaterialSaveData(SourceSaveData)
+    self.LoadMaterialSaveData = self:DeepCopy(self.MaterialSaveData)
     if bUndo then
-        if self.LoadMaterialSourceSaveData then
-            self:UseMaterialSourceStates(
-                self.LoadMaterialSourceSaveData
+        if self.LoadMaterialSaveData then
+            self:UseMaterialDatas(
+                self.LoadMaterialSaveData
             )
         else
             self:RestoreAllMaterials()
@@ -242,8 +241,10 @@ end
 
 --[[
     接口函数：前端修改模型数据。
-    入参材质结构：table.Materials / table.MaterialStates，结构同 GetSavedMaterialInteractionData 注释。
-    如果带材质数据，必须走 ApplyMaterialInteractionData，保证和外部材质修改同一入口。
+    入参材质结构：统一使用 table.Materials；table.MaterialStates 仅兼容旧调用。
+    优化：SetData 是外部修改统一入口。材质数据先同步 CurrentState/MID，
+    当 table.bCommitMaterials/table.CommitMaterials/table.bSaveMaterials 为 true 时，
+    再把当前应用参数提交到 SourceState/MaterialSaveData，触发保存机制。
 ]]
 function M:SetData(table)
     print(self.originalSize, "OriginalSize")
@@ -259,13 +260,19 @@ function M:SetData(table)
         )
 
     if MaterialState then
-        self:ApplyMaterialInteractionData(MaterialState)
+        self:ApplyMaterialInteractionData(
+            MaterialState,
+            table.bCommitMaterials or table.CommitMaterials or table.bSaveMaterials
+        )
+    elseif table.bCommitMaterials or table.CommitMaterials or table.bSaveMaterials then
+        -- 优化：允许 SetData 只传提交标记，将已有 CurrentState 固化到 SourceState。
+        self:CommitMaterialDatas()
     end
 end
 
 --[[
     接口函数：前端读取模型数据。
-    出参材质结构：MDTV.Materials = self.MaterialSaveData，即已保存/已提交的前端交互材质状态。
+    出参材质结构：MDTV.Materials = self.MaterialSaveData，即统一的已保存 SourceState。
 ]]
 function M:GetData(CH)
     local T = self:GetTransform()
@@ -455,14 +462,8 @@ function M:GetModelSize()
 
     self:InitMaterialDatas()
 
-    if self.LoadMaterialSourceSaveData then
-        self:UseMaterialSourceStates(
-            self.LoadMaterialSourceSaveData
-        )
-    end
-
     if self.LoadMaterialSaveData then
-        self:ApplyMaterialInteractionData(
+        self:UseMaterialDatas(
             self.LoadMaterialSaveData
         )
     end
@@ -542,7 +543,7 @@ function M:GetMaterialSaveState(State)
 
     return
     {
-        TemplateID = Normalized.TemplateID,
+        -- 优化：TemplateID/TemplateName 功能重复，对外只保留稳定可读的 TemplateName。
         TemplateName = TemplateName,
         Params = Params
     }
@@ -616,9 +617,9 @@ function M:InitMaterialDatas()
 
                 bModified = false,
 
+                -- 优化：SourceState 是唯一保存源数据，字段与 ModelSave/GetData 的 Materials 对齐。
                 SourceState =
                 {
-                    TemplateID = 0,
                     TemplateName = nil,
 
                     Params =
@@ -627,9 +628,9 @@ function M:InitMaterialDatas()
                         )
                 },
 
+                -- 优化：CurrentState 只保存外部当前修改，提交后会复制回 SourceState。
                 CurrentState =
                 {
-                    TemplateID = 0,
                     TemplateName = nil,
 
                     Params = {}
@@ -750,7 +751,6 @@ function M:SyncMaterialStateFromMID(
     Data.CurrentState =
         self:NormalizeMaterialState(
         {
-            TemplateID = 0,
             TemplateName = nil,
             Params = Params
         }
@@ -828,15 +828,18 @@ function M:ApplyMaterialChange(
     local bTemplateChanged = false
 
     if Change.TemplateID ~= nil then
-        State.TemplateID =
-            tonumber(Change.TemplateID) or 0
-        State.TemplateName = nil
+        -- 优化：兼容旧入参 TemplateID，但内部/输出统一落到 TemplateName。
+        State.TemplateName =
+            self:ResolveTemplateName(
+            {
+                TemplateID = Change.TemplateID
+            }
+            )
         bTemplateChanged = true
     end
 
     if Change.TemplateName ~= nil then
         State.TemplateName = Change.TemplateName
-        State.TemplateID = Change.TemplateID or State.TemplateID or 0
         bTemplateChanged = true
     end
 
@@ -1017,16 +1020,16 @@ function M:NormalizeMaterialState(State)
     local Normalized =
         self:DeepCopy(State or {})
 
-    Normalized.TemplateID =
-        tonumber(Normalized.TemplateID) or 0
+    -- 优化：TemplateID 仅作为旧数据/旧接口兼容输入，归一化后不再保留。
+    local TemplateName =
+        self:ResolveTemplateName(Normalized)
 
-    if Normalized.TemplateName and not MaterialTemplateData[Normalized.TemplateName] then
+    Normalized.TemplateID = nil
+
+    if TemplateName and MaterialTemplateData[TemplateName] then
+        Normalized.TemplateName = TemplateName
+    else
         Normalized.TemplateName = nil
-    end
-
-    if not Normalized.TemplateName then
-        Normalized.TemplateName =
-            self:ResolveTemplateName(Normalized)
     end
 
     Normalized.Params =
@@ -1131,7 +1134,6 @@ function M:RestoreMaterial(MaterialKey)
 
     Data.CurrentState =
     {
-        TemplateID = 0,
         TemplateName = nil,
         Params = {}
     }
@@ -1161,8 +1163,9 @@ end
     接口函数：外部/前端直接改材质的统一入口。
     支持结构：
     1) { MaterialKey = "0", State = MaterialState, bCommit = true }
-    2) { MaterialKey = "0", TemplateID = 1, Params = { RoughnessRation = 0.2 }, bCommit = true }
-    3) { Materials = { [MaterialKey] = MaterialState } } 批量交互结构
+    2) { MaterialKey = "0", TemplateName = "Gold", Params = { RoughnessRation = 0.2 }, bCommit = true }
+    3) { Materials = { [MaterialKey] = MaterialState }, bCommit = true } 批量交互结构
+       TemplateID 仅兼容旧入参，内部/输出统一为 TemplateName。
 ]]
 function M:GetMaterialData(JSONT)
     if not JSONT then
@@ -1173,7 +1176,10 @@ function M:GetMaterialData(JSONT)
         JSONT.Materials or JSONT.MaterialStates
 
     if SaveData then
-        self:ApplyMaterialInteractionData(SaveData)
+        self:ApplyMaterialInteractionData(
+            SaveData,
+            JSONT.bCommit or JSONT.bCommitMaterials or JSONT.CommitMaterials or JSONT.bSaveMaterials
+        )
         return true
     end
 
@@ -1268,7 +1274,6 @@ end
 function M:GetEmptyMaterialState()
     return
     {
-        TemplateID = 0,
         TemplateName = nil,
         Params = {}
     }
@@ -1296,37 +1301,25 @@ function M:GetCommittedMaterialSourceState(Data)
             CurrentState
         )
 
-    local TemplateID = CurrentState.TemplateID
-    local TemplateName = CurrentState.TemplateName
-
-    if not TemplateName then
-        TemplateID = SourceState.TemplateID
-        TemplateName = SourceState.TemplateName
-    end
+    local TemplateName =
+        CurrentState.TemplateName or SourceState.TemplateName
 
     return self:GetMaterialSaveState(
     {
-        TemplateID = TemplateID,
         TemplateName = TemplateName,
         Params = FinalParams
     }
     )
 end
 
--- 保存点：把 CurrentState 复制/固化为新的 SourceState，同时刷新 MaterialSourceSaveData 和 MaterialSaveData。
+-- 优化：保存点只维护 MaterialSaveData 一份数据；把 CurrentState 复制/固化为 SourceState。
 function M:CommitMaterialDatas(MaterialKey)
     if not self.MaterialDatas then
-        self.MaterialSourceSaveData = nil
         self.MaterialSaveData = nil
         return nil
     end
 
-    local SourceSaveData =
-        self:DeepCopy(
-            self.MaterialSourceSaveData or {}
-        )
-
-    local FrontSaveData =
+    local SaveData =
         self:DeepCopy(
             self.MaterialSaveData or {}
         )
@@ -1348,20 +1341,14 @@ function M:CommitMaterialDatas(MaterialKey)
 
             Data.bModified = false
 
-            SourceSaveData[Key] =
-                self:DeepCopy(
-                    SourceState
-                )
-
-            FrontSaveData[Key] =
+            SaveData[Key] =
                 self:DeepCopy(
                     SourceState
                 )
 
             self:_ApplyMaterial(Key)
         else
-            SourceSaveData[Key] = nil
-            FrontSaveData[Key] = nil
+            SaveData[Key] = nil
         end
     end
 
@@ -1375,8 +1362,7 @@ function M:CommitMaterialDatas(MaterialKey)
             CommitOne(MaterialKey, Data)
         end
     else
-        SourceSaveData = {}
-        FrontSaveData = {}
+        SaveData = {}
 
         for Key, Data in pairs(
             self.MaterialDatas
@@ -1385,14 +1371,9 @@ function M:CommitMaterialDatas(MaterialKey)
         end
     end
 
-    self.MaterialSourceSaveData =
-        self:NormalizeMaterialSourceSaveData(
-            SourceSaveData
-        )
-
     self.MaterialSaveData =
         self:NormalizeMaterialSaveData(
-            FrontSaveData
+            SaveData
         )
 
     return self:DeepCopy(
@@ -1431,11 +1412,8 @@ function M:GetMaterialDataSnapshot(bCommit)
 end
 
 function M:SaveMaterialSourceStates()
-    self:CommitMaterialDatas()
-
-    return self:DeepCopy(
-        self.MaterialSourceSaveData
-    )
+    -- 旧接口兼容：不再维护 MaterialSourceSaveData，统一返回 Materials 保存数据。
+    return self:SaveMaterialDatas()
 end
 
 function M:SaveMaterialDatas()
@@ -1447,9 +1425,8 @@ end
 --[[
     接口函数：前端交互材质结构归一化。
     通信结构：
-    Materials / MaterialStates = {
+    Materials = {
         [MaterialKey] = {
-            TemplateID = number,
             TemplateName = string | nil,
             Params = {
                 BaseColorConstant = { R, G, B },
@@ -1491,29 +1468,34 @@ function M:AppendMaterialInteractionData(
     return DataTable
 end
 
--- 接口函数：SetData/前端材质交互统一入口；内部走 ApplyMaterialChange，同步状态、参数、MID 和保存数据。
+-- 接口函数：SetData/前端材质交互统一入口；内部走 ApplyMaterialChange，同步 CurrentState、MID；
+-- 优化：只有 bCommit 为 true 时才刷新 SourceState/MaterialSaveData。
 function M:ApplyMaterialInteractionData(
-    SaveData
+    SaveData,
+    bCommit
 )
     local NormalizedSaveData =
         self:GetSavedMaterialInteractionData(SaveData)
 
     if not NormalizedSaveData then
-        self.MaterialSaveData = nil
+        if bCommit then
+            self.MaterialSaveData = nil
+        end
         self.LoadMaterialSaveData = nil
         return
     end
-
-    self.MaterialSaveData =
-        self:DeepCopy(
-            NormalizedSaveData
-        )
 
     if not self.MaterialDatas or not next(self.MaterialDatas) then
         self.LoadMaterialSaveData =
             self:DeepCopy(
                 NormalizedSaveData
             )
+        if bCommit then
+            self.MaterialSaveData =
+                self:DeepCopy(
+                    NormalizedSaveData
+                )
+        end
         return
     end
 
@@ -1524,7 +1506,7 @@ function M:ApplyMaterialInteractionData(
             Key,
             {
                 State = Saved,
-                bCommit = true
+                bCommit = bCommit
             }
         )
     end
@@ -1532,40 +1514,35 @@ function M:ApplyMaterialInteractionData(
     self.LoadMaterialSaveData = nil
 end
 
--- ModelLoad 专用：恢复存档 SourceState，不使用前端交互结构进行混写。
+-- 优化：ModelLoad/旧接口统一恢复 Materials 到 SourceState，不再区分 MaterialSourceStates。
 function M:UseMaterialSourceStates(
     SaveData
 )
-    local NormalizedSourceData =
-        self:NormalizeMaterialSourceSaveData(
+    local NormalizedSaveData =
+        self:NormalizeMaterialSaveData(
             SaveData
-        )
-
-    self.MaterialSourceSaveData =
-        self:DeepCopy(
-            NormalizedSourceData
         )
 
     self.MaterialSaveData =
         self:DeepCopy(
-            NormalizedSourceData
+            NormalizedSaveData
         )
 
-    if not NormalizedSourceData then
-        self.LoadMaterialSourceSaveData = nil
+    if not NormalizedSaveData then
+        self.LoadMaterialSaveData = nil
         return
     end
 
     if not self.MaterialDatas or not next(self.MaterialDatas) then
-        self.LoadMaterialSourceSaveData =
+        self.LoadMaterialSaveData =
             self:DeepCopy(
-                NormalizedSourceData
+                NormalizedSaveData
             )
         return
     end
 
     for Key, SourceState in pairs(
-        NormalizedSourceData
+        NormalizedSaveData
     ) do
         local Data =
             self.MaterialDatas[
@@ -1589,7 +1566,7 @@ function M:UseMaterialSourceStates(
         end
     end
 
-    self.LoadMaterialSourceSaveData = nil
+    self.LoadMaterialSaveData = nil
 end
 
 function M:LoadMaterialSourceStates(
