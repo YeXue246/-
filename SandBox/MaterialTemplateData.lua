@@ -1,6 +1,12 @@
 
 local MaterialTemplateData = {}
 
+--[[
+    材质模板只保存动态材质实例实际使用的参数：
+    BaseColorConstant 为 0~1 线性颜色，Metallic/Roughness/Normal 建议保持 0~1；
+    Emissive 可大于 1，用于 LED、屏幕等自发光效果。
+]]
+
 ----------------------------------------------------------------
 -- 黄金材质
 ----------------------------------------------------------------
@@ -77,7 +83,7 @@ MaterialTemplateData.PolishedSteel =
 }
 
 ----------------------------------------------------------------
--- 镀锌钢板
+-- 新镀锌钢板：偏亮、偏冷，适合新设备外壳或金属板材
 ----------------------------------------------------------------
 MaterialTemplateData.NewGalvanizedSteel =
 {
@@ -515,7 +521,7 @@ MaterialTemplateData.WarningRed =
 }
 
 ----------------------------------------------------------------
--- 工业默认材质
+-- 工业默认材质：需与 BP_ImportModel.lua 的默认兜底参数保持一致
 ----------------------------------------------------------------
 
 MaterialTemplateData.IndustrialDefault =
@@ -550,14 +556,14 @@ MaterialTemplateData.BrushedSteel =
         B = 0.750
     },
 
-    MetallicRation  = 0.950,
+    MetallicRation  = 1.000,
     RoughnessRation = 0.420,
     EmissiveRation  = 0.000,
     NormalRation    = 1.000
 }
 
 ----------------------------------------------------------------
--- 镀锌钢板
+-- 普通镀锌钢板：比 NewGalvanizedSteel 更灰、更粗糙，用于常规/轻度氧化板材
 ----------------------------------------------------------------
 
 MaterialTemplateData.GalvanizedSteel =
@@ -569,8 +575,8 @@ MaterialTemplateData.GalvanizedSteel =
         B = 0.780
     },
 
-    MetallicRation  = 0.880,
-    RoughnessRation = 0.480,
+    MetallicRation  = 1.000,
+    RoughnessRation = 0.520,
     EmissiveRation  = 0.000,
     NormalRation    = 1.000
 }
