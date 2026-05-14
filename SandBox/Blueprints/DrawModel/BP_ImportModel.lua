@@ -13,22 +13,59 @@ local DFL = require("SandBox.DataFunction")
 local MaterialTemplateData =
     require("SandBox.MaterialTemplateData")
 
+local MaterialParamNames =
+{
+    "BaseColorConstant",
+    "MetallicRation",
+    "RoughnessRation",
+    "EmissiveRation",
+    "NormalRation"
+}
+
+local MaterialTemplateOrder =
+{
+    "Gold",
+    "ChromeSilver",
+    "Iron",
+    "PolishedSteel",
+    "NewGalvanizedSteel",
+    "PolishedAluminum",
+    "Copper",
+    "MirrorStainlessSteel",
+    "WhiteSemiGlossPaintMetal",
+    "BlackPaintMetal",
+    "PlasticBlack",
+    "PlasticWhite",
+    "MattePlastic",
+    "Rubber",
+    "Concrete",
+    "CementFloor",
+    "IndustrialFloor",
+    "WhiteWall",
+    "LEDRed",
+    "LEDGreen",
+    "LEDBlue",
+    "Screen",
+    "WarningYellow",
+    "WarningRed",
+    "IndustrialDefault",
+    "BrushedSteel",
+    "GalvanizedSteel"
+}
+
 local DefaultMaterialParams =
 {
-    [123] =
+    BaseColorConstant =
     {
-        BaseColorConstant =
-        {
-            R = 0.650,
-            G = 0.650,
-            B = 0.680
-        },
+        R = 0.650,
+        G = 0.650,
+        B = 0.680
+    },
 
-        MetallicRation    = 0.100,
-        RoughnessRation   = 0.550,
-        EmissiveRation    = 0.000,
-        NormalRation      = 1.000
-    }
+    MetallicRation    = 0.100,
+    RoughnessRation   = 0.550,
+    EmissiveRation    = 0.000,
+    NormalRation      = 1.000
 }
 
 
@@ -42,6 +79,7 @@ function M:Initialize(Initializer)
     self.bMove = true
     self.bLoading = false -- 加载状态标记
     self.MaterialDatas = {}
+    self.MaterialSaveData = nil
 end
 
 function M:ReceiveBeginPlay()
@@ -154,8 +192,16 @@ function M:ModelLoad(table, bUndo)
     self.modelType            = table["Type"]
     self.size                 = BS
     self.originalSize         = OS
-    self.LoadMaterialSaveData = table["Materials"]
+    self.MaterialSaveData     = self:NormalizeMaterialSaveData(table["Materials"])
+    self.LoadMaterialSaveData = self:DeepCopy(self.MaterialSaveData)
     if bUndo then
+        if self.LoadMaterialSaveData then
+            self:UseMaterialDatas(
+                self.LoadMaterialSaveData
+            )
+        else
+            self:RestoreAllMaterials()
+        end
         return
     end
     self:LoadModel()
@@ -179,6 +225,13 @@ function M:SetData(table)
     self:K2_SetActorTransform(table.T, false, UE.FHitResult(), false)
     -- self.showName = table.showname
     self:GetAttachParentActor().showName = table.showname
+
+    local MaterialState =
+        table.Materials or table.MaterialStates
+
+    if MaterialState then
+        self:UseMaterialDatas(MaterialState)
+    end
 end
 
 function M:GetData(CH)
@@ -198,6 +251,7 @@ function M:GetData(CH)
         bBasic = self.bBasic,
         showname = self:GetAttachParentActor().showName,
         bMove = self.bMove,
+        Materials = self:GetMaterialDataSnapshot(),
     }
     return MDTV
 end
@@ -367,7 +421,7 @@ function M:GetModelSize()
     self:InitMaterialDatas()
 
     if self.LoadMaterialSaveData then
-        self:LoadMaterialDatas(
+        self:UseMaterialDatas(
             self.LoadMaterialSaveData
         )
     end
@@ -402,76 +456,164 @@ function M:DeepCopy(obj)
     return newTable
 end
 
+function M:CopyMaterialParamTable(Params)
+    local Result = {}
+
+    if not Params then
+        return Result
+    end
+
+    for _, ParamName in ipairs(MaterialParamNames) do
+        if Params[ParamName] ~= nil then
+            Result[ParamName] =
+                self:DeepCopy(
+                    Params[ParamName]
+                )
+        end
+    end
+
+    return Result
+end
+
+function M:IsEmptyTable(Table)
+    if not Table then
+        return true
+    end
+
+    return next(Table) == nil
+end
+
+function M:GetMaterialSaveState(State)
+    local Normalized =
+        self:NormalizeMaterialState(State)
+
+    local Params =
+        self:CopyMaterialParamTable(
+            Normalized.Params
+        )
+
+    local TemplateName =
+        self:ResolveTemplateName(Normalized)
+
+    if not TemplateName and self:IsEmptyTable(Params) then
+        return nil
+    end
+
+    return
+    {
+        TemplateID = Normalized.TemplateID,
+        TemplateName = TemplateName,
+        Params = Params
+    }
+end
+
+function M:GetMaterialComponents()
+    local Components = {}
+
+    if self.Meshs and self.Meshs:Num() > 0 then
+        for i = 1, self.Meshs:Num() do
+            local Component =
+                self.Meshs[i]
+
+            if Component and UE.UKismetSystemLibrary.IsValid(Component) then
+                Components[#Components + 1] =
+                {
+                    Component = Component,
+                    ComponentIndex = i,
+                    KeyPrefix = "M" .. tostring(i) .. ":"
+                }
+            end
+        end
+    end
+
+    if #Components == 0 and self.PMesh then
+        Components[#Components + 1] =
+        {
+            Component = self.PMesh,
+            ComponentIndex = 0,
+            KeyPrefix = ""
+        }
+    end
+
+    return Components
+end
+
 function M:InitMaterialDatas()
     self.MaterialDatas = {}
 
-    local Count = self.PMesh:GetNumMaterials()
+    local Components =
+        self:GetMaterialComponents()
 
-    for i = 0, Count - 1 do
-        local MID =
-            self.PMesh:CreateDynamicMaterialInstance(i)
+    for _, ComponentData in ipairs(Components) do
+        local Component =
+            ComponentData.Component
 
-        local SourceParams =
-            self:ReadSourceMaterial(i)
+        local Count =
+            Component:GetNumMaterials()
 
-        local Key = tostring(i)
+        for i = 0, Count - 1 do
+            local MID =
+                Component:CreateDynamicMaterialInstance(i)
 
-        self.MaterialDatas[Key] =
-        {
-            MaterialKey = Key,
+            local SourceParams =
+                self:ReadSourceMaterial(Component, i)
 
-            SlotIndex = i,
+            local Key =
+                ComponentData.KeyPrefix .. tostring(i)
 
-            MID = MID,
-
-            bModified = false,
-
-            SourceState =
+            self.MaterialDatas[Key] =
             {
-                TemplateID = 0,
+                MaterialKey = Key,
 
-                Params =
-                    self:DeepCopy(
-                        SourceParams
-                    )
-            },
+                ComponentIndex = ComponentData.ComponentIndex,
 
-            CurrentState =
-            {
-                TemplateID = 0,
+                Component = Component,
 
-                Params =
-                    self:DeepCopy(
-                        SourceParams
-                    )
+                SlotIndex = i,
+
+                MID = MID,
+
+                bModified = false,
+
+                SourceState =
+                {
+                    TemplateID = 0,
+                    TemplateName = nil,
+
+                    Params =
+                        self:DeepCopy(
+                            SourceParams
+                        )
+                },
+
+                CurrentState =
+                {
+                    TemplateID = 0,
+                    TemplateName = nil,
+
+                    Params = {}
+                }
+
             }
-
-        }
+        end
     end
 end
 
-function M:ReadSourceMaterial(SlotIndex)
+function M:ReadSourceMaterial(Component, SlotIndex)
+    if not SlotIndex then
+        SlotIndex = Component
+        Component = self.PMesh
+    end
+
     local MID =
-        self.PMesh:GetMaterial(SlotIndex)
+        Component and Component:GetMaterial(SlotIndex)
 
     --------------------------------------------------
     -- 默认兜底
     --------------------------------------------------
 
     local Params =
-    {
-        BaseColorConstant =
-        {
-            R = 1,
-            G = 1,
-            B = 1
-        },
-
-        MetallicRation    = 0,
-        RoughnessRation   = 0.5,
-        EmissiveRation    = 0,
-        NormalRation      = 1
-    }
+        self:DeepCopy(DefaultMaterialParams)
 
     if not MID then
         return Params
@@ -544,6 +686,147 @@ function M:ReadSourceMaterial(SlotIndex)
     return Params
 end
 
+-- 外部如果直接改了 MID 参数，可调用本函数把 MID 当前值同步回 CurrentState。
+function M:SyncMaterialStateFromMID(
+    MaterialKey,
+    bCommit
+)
+    local Data =
+        self.MaterialDatas[
+        MaterialKey
+        ]
+
+    if not Data then
+        return false
+    end
+
+    local Params =
+        self:ReadSourceMaterial(
+            Data.Component or self.PMesh,
+            Data.SlotIndex
+        )
+
+    Data.CurrentState =
+        self:NormalizeMaterialState(
+        {
+            TemplateID = 0,
+            TemplateName = nil,
+            Params = Params
+        }
+        )
+
+    if bCommit then
+        self:CommitMaterialDatas(MaterialKey)
+    else
+        Data.bModified = true
+    end
+
+    return true
+end
+
+-- 统一材质修改入口：支持切模板、单参数、多参数、恢复和外部 MID 同步。
+-- 示例：ApplyMaterialChange(Key, "RoughnessRation", 0.4)
+-- 示例：ApplyMaterialChange(Key, { TemplateName = "Gold", Params = { RoughnessRation = 0.2 } })
+function M:ApplyMaterialChange(
+    MaterialKey,
+    Change,
+    Value
+)
+    local Data =
+        self.MaterialDatas[
+        MaterialKey
+        ]
+
+    if not Data then
+        return false
+    end
+
+    if type(Change) == "string" then
+        Change =
+        {
+            Params =
+            {
+                [Change] = Value
+            }
+        }
+    end
+
+    if not Change then
+        return false
+    end
+
+    if Change.bRestore then
+        return self:RestoreMaterial(MaterialKey)
+    end
+
+    if Change.bSyncFromMID then
+        return self:SyncMaterialStateFromMID(
+            MaterialKey,
+            Change.bCommit
+        )
+    end
+
+    local State =
+        self:NormalizeMaterialState(
+            Data.CurrentState
+        )
+
+    if Change.State then
+        State =
+            self:NormalizeMaterialState(
+                Change.State
+            )
+    end
+
+    local bTemplateChanged = false
+
+    if Change.TemplateID ~= nil then
+        State.TemplateID =
+            tonumber(Change.TemplateID) or 0
+        State.TemplateName = nil
+        bTemplateChanged = true
+    end
+
+    if Change.TemplateName ~= nil then
+        State.TemplateName = Change.TemplateName
+        State.TemplateID = Change.TemplateID or State.TemplateID or 0
+        bTemplateChanged = true
+    end
+
+    State.TemplateName =
+        self:ResolveTemplateName(State)
+
+    local Params =
+        Change.Params or Change.ParamValues
+
+    if bTemplateChanged and not Change.bKeepParams then
+        State.Params = {}
+    end
+
+    if Params then
+        State.Params =
+            State.Params or {}
+
+        for ParamName, ParamValue in pairs(Params) do
+            State.Params[ParamName] =
+                self:DeepCopy(ParamValue)
+        end
+    end
+
+    Data.CurrentState =
+        self:NormalizeMaterialState(State)
+
+    Data.bModified = true
+
+    self:_ApplyMaterial(MaterialKey)
+
+    if Change.bCommit then
+        self:CommitMaterialDatas(MaterialKey)
+    end
+
+    return true
+end
+
 function M:UpdateMaterialState(
     MaterialKey,
     NewState
@@ -557,27 +840,11 @@ function M:UpdateMaterialState(
         return
     end
 
-    --------------------------------------------------
-    -- State
-    --------------------------------------------------
-
-    Data.CurrentState =
-        self:DeepCopy(
-            NewState
-        )
-
-    --------------------------------------------------
-    -- Dirty
-    --------------------------------------------------
-
-    Data.bModified = true
-
-    --------------------------------------------------
-    -- 自动刷新
-    --------------------------------------------------
-
-    self:_ApplyMaterial(
-        MaterialKey
+    self:ApplyMaterialChange(
+        MaterialKey,
+        {
+            State = NewState
+        }
     )
 end
 
@@ -595,36 +862,10 @@ function M:UpdateMaterialParam(
         return
     end
 
-    --------------------------------------------------
-    -- CurrentState
-    --------------------------------------------------
-
-    local State =
-        Data.CurrentState
-
-    State.Params =
-        State.Params or {}
-
-    --------------------------------------------------
-    -- 修改
-    --------------------------------------------------
-
-    State.Params[
-    ParamName
-    ] = Value
-
-    --------------------------------------------------
-    -- Dirty
-    --------------------------------------------------
-
-    Data.bModified = true
-
-    --------------------------------------------------
-    -- 自动刷新
-    --------------------------------------------------
-
-    self:_ApplyMaterial(
-        MaterialKey
+    self:ApplyMaterialChange(
+        MaterialKey,
+        ParamName,
+        Value
     )
 end
 
@@ -645,7 +886,9 @@ function M:_ApplyMaterial(MaterialKey)
     end
 
     local State =
-        Data.CurrentState
+        self:NormalizeMaterialState(
+            Data.CurrentState
+        )
 
     --------------------------------------------------
     -- Source
@@ -661,7 +904,7 @@ function M:_ApplyMaterial(MaterialKey)
     --------------------------------------------------
 
     local TemplateName =
-        State.TemplateName
+        self:ResolveTemplateName(State)
 
     if TemplateName then
         local Template =
@@ -696,6 +939,49 @@ function M:_ApplyMaterial(MaterialKey)
         MID,
         FinalParams
     )
+end
+
+function M:ResolveTemplateName(State)
+    if not State then
+        return nil
+    end
+
+    if State.TemplateName and MaterialTemplateData[State.TemplateName] then
+        return State.TemplateName
+    end
+
+    local TemplateID =
+        tonumber(State.TemplateID)
+
+    if TemplateID and TemplateID > 0 then
+        return MaterialTemplateOrder[TemplateID]
+    end
+
+    return nil
+end
+
+function M:NormalizeMaterialState(State)
+    local Normalized =
+        self:DeepCopy(State or {})
+
+    Normalized.TemplateID =
+        tonumber(Normalized.TemplateID) or 0
+
+    if Normalized.TemplateName and not MaterialTemplateData[Normalized.TemplateName] then
+        Normalized.TemplateName = nil
+    end
+
+    if not Normalized.TemplateName then
+        Normalized.TemplateName =
+            self:ResolveTemplateName(Normalized)
+    end
+
+    Normalized.Params =
+        self:CopyMaterialParamTable(
+            Normalized.Params
+        )
+
+    return Normalized
 end
 
 function M:MergeParams(Base, Override)
@@ -783,23 +1069,39 @@ function M:RestoreMaterial(MaterialKey)
         ]
 
     if not Data then
-        return
+        return false
     end
 
     --------------------------------------------------
-    -- 恢复 Commit
+    -- 恢复到初始化时读取的原始材质
     --------------------------------------------------
 
     Data.CurrentState =
-        self:DeepCopy(
-            Data.SourceState
-        )
+    {
+        TemplateID = 0,
+        TemplateName = nil,
+        Params = {}
+    }
 
     Data.bModified = false
 
     self:_ApplyMaterial(
         MaterialKey
     )
+
+    return true
+end
+
+function M:RestoreAllMaterials()
+    if not self.MaterialDatas then
+        return
+    end
+
+    for Key, _ in pairs(
+        self.MaterialDatas
+    ) do
+        self:RestoreMaterial(Key)
+    end
 end
 
 function M:SetMaterialState(
@@ -815,23 +1117,11 @@ function M:SetMaterialState(
         return
     end
 
-    --------------------------------------------------
-    -- 更新状态
-    --------------------------------------------------
-
-    Data.CurrentState =
-        self:DeepCopy(
-            NewState
-        )
-
-    Data.bModified = true
-
-    --------------------------------------------------
-    -- Apply
-    --------------------------------------------------
-
-    self:_ApplyMaterial(
-        MaterialKey
+    self:ApplyMaterialChange(
+        MaterialKey,
+        {
+            State = NewState
+        }
     )
 end
 
@@ -849,86 +1139,162 @@ function M:SetMaterialParam(
         return
     end
 
-    --------------------------------------------------
-    -- CurrentState
-    --------------------------------------------------
-
-    local State =
-        Data.CurrentState
-
-    if not State then
-        return
-    end
-
-    --------------------------------------------------
-    -- Params
-    --------------------------------------------------
-
-    State.Params =
-        State.Params or {}
-
-    --------------------------------------------------
-    -- 修改当前状态
-    --------------------------------------------------
-
-    State.Params[
-    ParamName
-    ] = Value
-
-    --------------------------------------------------
-    -- 标记修改
-    --------------------------------------------------
-
-    Data.bModified = true
-
-    --------------------------------------------------
-    -- 重新应用
-    --------------------------------------------------
-
-    self:_ApplyMaterial(
-        MaterialKey
+    self:ApplyMaterialChange(
+        MaterialKey,
+        ParamName,
+        Value
     )
 end
 
-function M:SaveMaterialDatas()
+function M:NormalizeMaterialSaveData(SaveData)
+    if not SaveData then
+        return nil
+    end
+
+    local Result = {}
+    local bHasData = false
+
+    for Key, Saved in pairs(
+        SaveData
+    ) do
+        local State =
+            self:GetMaterialSaveState(
+                Saved
+            )
+
+        if State then
+            Result[Key] = State
+            bHasData = true
+        end
+    end
+
+    if not bHasData then
+        return nil
+    end
+
+    return Result
+end
+
+function M:CommitMaterialDatas(MaterialKey)
+    if not self.MaterialDatas then
+        self.MaterialSaveData = nil
+        return nil
+    end
+
+    local SaveData =
+        self:DeepCopy(
+            self.MaterialSaveData or {}
+        )
+
+    local function CommitOne(Key, Data)
+        local State =
+            self:GetMaterialSaveState(
+                Data.CurrentState
+            )
+
+        if State then
+            SaveData[Key] = State
+        else
+            SaveData[Key] = nil
+        end
+
+        Data.bModified = false
+    end
+
+    if MaterialKey then
+        local Data =
+            self.MaterialDatas[
+            MaterialKey
+            ]
+
+        if Data then
+            CommitOne(MaterialKey, Data)
+        end
+    else
+        SaveData = {}
+
+        for Key, Data in pairs(
+            self.MaterialDatas
+        ) do
+            CommitOne(Key, Data)
+        end
+    end
+
+    self.MaterialSaveData =
+        self:NormalizeMaterialSaveData(
+            SaveData
+        )
+
+    return self:DeepCopy(
+        self.MaterialSaveData
+    )
+end
+
+-- bCommit 为 true 时才把当前修改提交为可保存数据；为空时只生成当前预览快照。
+function M:GetMaterialDataSnapshot(bCommit)
+    if bCommit then
+        return self:CommitMaterialDatas()
+    end
+
     local SaveData = {}
+    local bHasData = false
 
     for Key, Data in pairs(
         self.MaterialDatas
     ) do
-        --------------------------------------------------
-        -- 保存 CurrentState
-        --------------------------------------------------
-
-        SaveData[Key] =
-            self:DeepCopy(
+        local State =
+            self:GetMaterialSaveState(
                 Data.CurrentState
             )
 
-        --------------------------------------------------
-        -- Commit
-        --------------------------------------------------
+        if State then
+            SaveData[Key] = State
+            bHasData = true
+        end
+    end
 
-        Data.SourceState =
-            self:DeepCopy(
-                Data.CurrentState
-            )
-
-        Data.bModified = false
+    if not bHasData then
+        return nil
     end
 
     return SaveData
 end
 
-function M:LoadMaterialDatas(
+function M:SaveMaterialDatas()
+    return self:DeepCopy(
+        self.MaterialSaveData
+    )
+end
+
+-- SetData/ModelLoad 共用的材质状态恢复入口；材质槽未初始化时先暂存，模型加载完成后再应用。
+function M:UseMaterialDatas(
     SaveData
 )
-    if not SaveData then
+    local NormalizedSaveData =
+        self:NormalizeMaterialSaveData(
+            SaveData
+        )
+
+    self.MaterialSaveData =
+        self:DeepCopy(
+            NormalizedSaveData
+        )
+
+    if not NormalizedSaveData then
+        self.LoadMaterialSaveData = nil
+        return
+    end
+
+    if not self.MaterialDatas or not next(self.MaterialDatas) then
+        self.LoadMaterialSaveData =
+            self:DeepCopy(
+                NormalizedSaveData
+            )
         return
     end
 
     for Key, Saved in pairs(
-        SaveData
+        NormalizedSaveData
     ) do
         local Data =
             self.MaterialDatas[
@@ -936,33 +1302,33 @@ function M:LoadMaterialDatas(
             ]
 
         if Data then
-            --------------------------------------------------
-            -- Source
-            --------------------------------------------------
-
-            Data.SourceState =
-                self:DeepCopy(
+            local Normalized =
+                self:GetMaterialSaveState(
                     Saved
                 )
 
-            --------------------------------------------------
-            -- Current
-            --------------------------------------------------
+            if Normalized then
+                Data.CurrentState =
+                    self:DeepCopy(
+                        Normalized
+                    )
 
-            Data.CurrentState =
-                self:DeepCopy(
-                    Saved
+                Data.bModified = false
+
+                self:_ApplyMaterial(
+                    Key
                 )
-
-            --------------------------------------------------
-            -- Apply
-            --------------------------------------------------
-
-            self:_ApplyMaterial(
-                Key
-            )
+            end
         end
     end
+
+    self.LoadMaterialSaveData = nil
+end
+
+function M:LoadMaterialDatas(
+    SaveData
+)
+    self:UseMaterialDatas(SaveData)
 end
 
 return M
